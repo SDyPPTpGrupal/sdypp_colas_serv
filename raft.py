@@ -89,6 +89,16 @@ class NodoRaft:
         self._proximo_heartbeat_ms = 0
         self._reiniciar_timeout(0)
 
+        # Single-node mode is a majority of one, so this node is master from the
+        # start. Not a special case in the data path — it is the same `mayoria`
+        # arithmetic — but it must hold from the first instant: a window of being
+        # a slave is a window of emitting a `421` a lone node must never emit.
+        if not self.pares:
+            self.termino_actual = 1
+            self.voto_para = self.yo
+            self.rol = MASTER
+            self.master_conocido = self.yo
+
     # ------------------------------------------------------------- properties
     @property
     def mayoria(self) -> int:

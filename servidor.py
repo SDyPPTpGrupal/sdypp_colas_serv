@@ -34,6 +34,7 @@ colgarse es las dos cosas bien y cuesta un hilo, que es lo que sobra acá.
 
 import json
 import os
+import random
 import sys
 import threading
 import time
@@ -43,6 +44,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from colas import Pedido, Sistema
+from motor import Motor
+from raft import Entrada, NodoRaft
 
 # --- Configuración ---------------------------------------------------------
 # Todo por entorno con default, como en el resto del sistema.
@@ -94,13 +97,76 @@ INTERVALO_RECUPERADOR = float(os.environ.get("COLA_INTERVALO_RECUPERADOR", "0.25
 # Token compartido. Vacío = sin autenticación (sólo para probar en loopback).
 # En la demo va con token: sin él, cualquiera en el tailnet podría publicar
 # pedidos falsos o —peor— **tomarlos** y quedarse con tráfico real de usuarios.
-# Pendiente de la próxima vuelta: un token para el balanceador y otro para los
-# workers, porque publicar y consumir no son el mismo permiso.
 TOKEN = os.environ.get("COLA_TOKEN", "")
+
+# Publicar, consumir y hablar el protocolo del clúster no son el mismo permiso,
+# así que no comparten secreto. Los tres caen a COLA_TOKEN cuando no se definen,
+# que es lo que deja migrar un despliegue existente sin tocarle la configuración.
+#
+# El tercero no es simetría burocrática: sin él, cualquiera que alcance el puerto
+# puede postularse candidato o inyectar entradas en el log, que es la diferencia
+# entre replicar y ser replicado por un desconocido.
+TOKEN_PUBLICADOR = os.environ.get("COLA_TOKEN_PUBLICADOR", TOKEN)
+TOKEN_CONSUMIDOR = os.environ.get("COLA_TOKEN_CONSUMIDOR", TOKEN)
+TOKEN_CLUSTER = os.environ.get("COLA_TOKEN_CLUSTER", TOKEN)
+
+CONTRATO = "1.0"
+INSTANCIA = os.environ.get("COLA_INSTANCIA", f"{NOMBRE}-{PUERTO}@{CASA}")
+MI_URL = os.environ.get("COLA_URL", f"http://{BIND}:{PUERTO}")
+
+# Lista de pares, separada por comas y sin contarse a sí mismo. Vacía = nodo
+# solo, que es mayoría de uno y master de entrada (no hay rama especial en el
+# camino de datos: es la misma aritmética de `mayoria`).
+PARES = [u.strip().rstrip("/") for u in os.environ.get("COLA_PARES", "").split(",")
+         if u.strip() and u.strip().rstrip("/") != MI_URL.rstrip("/")]
+
+RAFT_HEARTBEAT_MS = int(os.environ.get("RAFT_HEARTBEAT_MS", "150"))
+RAFT_ELECCION_TIMEOUT_MS = int(os.environ.get("RAFT_ELECCION_TIMEOUT_MS", "600"))
 
 
 SISTEMA = Sistema(COTA_PEDIDOS, COTA_RESPUESTAS, RESERVA, TTL_RESPUESTAS)
 ARRANCADO = None
+
+RAFT = NodoRaft(yo=MI_URL, pares=PARES, reloj=lambda: int(time.monotonic() * 1000),
+                azar=random.Random(), timeout_eleccion_ms=RAFT_ELECCION_TIMEOUT_MS,
+                heartbeat_ms=RAFT_HEARTBEAT_MS)
+
+# `NodoRaft` no es thread-safe a propósito: meterle locks adentro habría puesto
+# concurrencia en la lógica que se testea, y los tests dejarían de ser
+# deterministas. El candado vive acá, que es donde está la concurrencia real.
+LOCK_RAFT = threading.RLock()
+
+# Lo setea `motor.py` cuando hay red que atender. En un nodo solo nunca hay
+# mensajes salientes, así que queda en None y no se usa.
+DESPACHAR = None
+
+
+def despachar(mensajes):
+    """Hand outbound Raft messages to the motor, if one is wired."""
+    if DESPACHAR is not None and mensajes:
+        DESPACHAR(mensajes)
+
+
+# Qué token abre cada ruta. La tabla es la autorización: si una ruta no está
+# acá, no existe, y agregar una obliga a decidir de quién es.
+CLASE_DE_TOKEN = {
+    "/pedidos": "publicador",
+    "/respuestas/tomar": "publicador",
+    "/pedidos/tomar": "consumidor",
+    "/pedidos/devolver": "consumidor",
+    "/respuestas": "consumidor",
+    "/raft/appendEntries": "cluster",
+    "/raft/requestVote": "cluster",
+    "/raft/estado": "cluster",
+    "/estado": "publicador",
+}
+
+# Las cinco rutas de datos, y sólo ellas, contestan 421 cuando este nodo no es
+# el master. `/health`, `/health/vivo` y `/raft/*` nunca lo hacen.
+RUTAS_DE_DATOS = frozenset((
+    "/pedidos", "/pedidos/tomar", "/pedidos/devolver",
+    "/respuestas", "/respuestas/tomar",
+))
 
 
 def _ahora_iso():
@@ -195,8 +261,27 @@ class Manejador(BaseHTTPRequestHandler):
             return None
         return datos if isinstance(datos, dict) else None
 
-    def autorizado(self):
-        return not TOKEN or self.headers.get("X-Cola-Token") == TOKEN
+    def autorizado(self, clase):
+        """Check the token class this route needs, not merely "a" token.
+
+        A consumer token that could publish would let a worker inject pedidos;
+        a data token that could reach `/raft/*` would let it join the cluster.
+        """
+        esperado = {"publicador": TOKEN_PUBLICADOR,
+                    "consumidor": TOKEN_CONSUMIDOR,
+                    "cluster": TOKEN_CLUSTER}[clase]
+        return not esperado or self.headers.get("X-Cola-Token") == esperado
+
+    def soy_master(self):
+        return RAFT.rol == "master"
+
+    def redirigir(self):
+        """421 Misdirected Request: literally "you asked a server that cannot
+        answer this". Distinct from the two `409`s on /respuestas, so a client
+        branching on the status alone cannot confuse a redirect with a discard.
+        """
+        self.responder(421, {"error": "no-soy-master",
+                             "master": RAFT.master_conocido})
 
     def ruta(self):
         return self.path.split("?")[0].rstrip("/") or "/"
@@ -318,12 +403,53 @@ class Manejador(BaseHTTPRequestHandler):
         self.responder(200, {
             "cola": "sana",
             "casa": CASA,
+            "instancia": INSTANCIA,
+            "contrato": CONTRATO,
             "arrancado": ARRANCADO,
+            # Quién manda, para que el balanceador y los workers se muden solos.
+            # `masterConocido` en null significa elección en curso: no es un
+            # error, es la única respuesta honesta mientras no haya master.
+            "rol": RAFT.rol,
+            "termino": RAFT.termino_actual,
+            "masterConocido": RAFT.master_conocido,
             "esperando": estado["pedidos"]["esperando"],
             "enVuelo": estado["pedidos"]["enVuelo"],
             "cota": estado["pedidos"]["cota"],
             "respuestasPendientes": estado["respuestas"]["pendientes"],
         })
+
+    def vivo(self):
+        """Liveness, and nothing else: 200 while the process serves HTTP.
+
+        Deliberately blind to role, term and master. It is what the container
+        HEALTHCHECK asks, and a node in the middle of an election is perfectly
+        alive — restarting it there would be exactly the wrong move.
+        """
+        self.responder(200, {"vivo": True})
+
+    # -- protocolo del clúster --
+
+    def raft_append(self, cuerpo):
+        cuerpo = dict(cuerpo)
+        cuerpo["entradas"] = [
+            Entrada(indice=e["indice"], termino=e["termino"],
+                    operacion=e["operacion"], payload=e.get("payload") or {})
+            for e in (cuerpo.get("entradas") or [])
+        ]
+        with LOCK_RAFT:
+            respuesta, salientes = RAFT.recibir_append(cuerpo)
+        despachar(salientes)
+        self.responder(200, respuesta)
+
+    def raft_voto(self, cuerpo):
+        with LOCK_RAFT:
+            respuesta, salientes = RAFT.recibir_solicitud_voto(cuerpo)
+        despachar(salientes)
+        self.responder(200, respuesta)
+
+    def raft_estado(self):
+        with LOCK_RAFT:
+            self.responder(200, RAFT.instantanea())
 
     def estado(self):
         datos = SISTEMA.estado()
@@ -337,8 +463,14 @@ class Manejador(BaseHTTPRequestHandler):
         ruta = self.ruta()
         if ruta == "/health":
             return self.salud()
+        if ruta == "/health/vivo":
+            return self.vivo()
+        if ruta == "/raft/estado":
+            if not self.autorizado("cluster"):
+                return self.responder(403, {"error": "token inválido"})
+            return self.raft_estado()
         if ruta in ("/", "/estado"):
-            if not self.autorizado():
+            if not self.autorizado("publicador"):
                 return self.responder(403, {"error": "token inválido"})
             return self.estado()
         self.responder(404, {"error": "no existe"})
@@ -357,15 +489,21 @@ class Manejador(BaseHTTPRequestHandler):
             "/pedidos/devolver": self.devolver_pedido,
             "/respuestas": self.publicar_respuesta,
             "/respuestas/tomar": self.tomar_respuesta,
+            "/raft/appendEntries": self.raft_append,
+            "/raft/requestVote": self.raft_voto,
         }
         manejar = rutas.get(ruta)
         if manejar is None:
             return self.responder(404, {"error": "no existe"})
-        if not self.autorizado():
+        if not self.autorizado(CLASE_DE_TOKEN[ruta]):
             bitacora(f"POST {ruta}", 403, f"ip={self.client_address[0]} token inválido")
             return self.responder(403, {"error": "token inválido"})
         if cuerpo is None:
             return self.responder(400, {"error": "cuerpo no es un objeto JSON"})
+        # El redirect va ANTES del handler, así que un nodo que no manda no
+        # muta nada ni cuenta nada para una mayoría antes de contestar.
+        if ruta in RUTAS_DE_DATOS and not self.soy_master():
+            return self.redirigir()
         manejar(cuerpo)
 
 
@@ -386,10 +524,28 @@ class Servidor(ThreadingHTTPServer):
         super().handle_error(request, direccion)
 
 
+def arrancar_motor():
+    """Wire the cluster's networking half, unless this node is alone.
+
+    A lone node has nobody to talk to and is already master, so starting a
+    ticker for it would burn a thread to discover that nothing changed.
+    """
+    global DESPACHAR
+    if not PARES:
+        return None
+    motor = Motor(RAFT, token=TOKEN_CLUSTER, lock=LOCK_RAFT,
+                  intervalo_ms=max(10, RAFT_HEARTBEAT_MS // 3),
+                  registrar=bitacora)
+    DESPACHAR = motor.enviar
+    motor.arrancar()
+    return motor
+
+
 def main():
     global ARRANCADO
     ARRANCADO = _ahora_iso()
     threading.Thread(target=recuperador, daemon=True).start()
+    arrancar_motor()
 
     servidor = Servidor((BIND, PUERTO), Manejador)
     # Un hilo por conexión y todas daemon: los long-poll se quedan colgados hasta
@@ -398,7 +554,9 @@ def main():
     bitacora("arranque", "OK",
              f"escucha={BIND}:{PUERTO} cotaPedidos={COTA_PEDIDOS} "
              f"cotaRespuestas={COTA_RESPUESTAS} reserva={RESERVA}s ttl={TTL_RESPUESTAS}s "
-             f"token={'sí' if TOKEN else 'NO'}")
+             f"token={'sí' if TOKEN else 'NO'} "
+             f"instancia={INSTANCIA} pares={len(PARES)} "
+             f"modo={'clúster' if PARES else 'nodo solo'}")
     if not TOKEN:
         print("[cola] sin COLA_TOKEN: cualquiera que alcance el puerto puede "
               "publicar y tomar pedidos", flush=True)

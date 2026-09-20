@@ -238,6 +238,10 @@ class TestEleccionPorMayoria(unittest.TestCase):
         cluster = ClusterFalso(1)
         self.assertEqual(cluster.nodos["n0"].mayoria, 1)
 
+        # Master from the first instant, with no election and no messages: there
+        # is nobody to ask, and a lone node must never be able to emit a `421`.
+        self.assertEqual(cluster.nodos["n0"].rol, "master")
+
         cluster.forzar_eleccion("n0")
         self.assertEqual(cluster.nodos["n0"].rol, "master")
 
