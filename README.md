@@ -18,6 +18,88 @@ COLA_PUERTO=8085 COLA_BIND=100.101.15.93 COLA_TOKEN=... python3 cola/servidor.py
 
 ---
 
+## El clúster: una cola lógica en tres nodos
+
+Un solo nodo es un punto único de falla, y lo que guarda no es descartable: son pedidos que el
+cliente ya vio aceptados. La cola corre entonces en **3 nodos (impar)** con un **Raft-lite**
+propio, en `raft.py`:
+
+- un **master** atiende *todo* el tráfico de datos;
+- los **slaves** replican su log y compiten por sucederlo;
+- si el master se cae, los nodos **eligen uno nuevo solos**, y los clientes se mudan siguiendo
+  un `421`.
+
+```
+COLA_PUERTO=8085 COLA_URL=http://127.0.0.1:8085 \
+COLA_PARES=http://127.0.0.1:8085,http://127.0.0.1:8086,http://127.0.0.1:8087 \
+COLA_TOKEN=... python3 servidor.py
+```
+
+`COLA_PARES` vacío = **nodo solo**, que es mayoría de uno: master desde el arranque, sin
+elección y sin emitir nunca un `421`. No hay rama especial en el camino de datos — es la misma
+aritmética de `mayoria`, con `N=1`.
+
+### `tomar` no es una lectura
+
+Es la sutileza que ordena todo el diseño, y la que más caro sale ignorar: `POST /pedidos/tomar`
+**reserva** el pedido, o sea que lo saca del pool de disponibles. Es una mutación. Por eso no se
+puede repartir entre slaves como si fueran réplicas de lectura: dos workers tomando contra dos
+nodos distintos se llevan el mismo pedido, y la garantía de a-lo-sumo-una-entrega se cae apenas
+la replicación tenga el menor retraso.
+
+### El redirect: `421 Misdirected Request`
+
+Cualquier nodo que no sea master contesta, en las **cinco rutas de datos**:
+
+```jsonc
+// ← 421
+{"error": "no-soy-master", "master": "http://cola-2:8085"}   // o "master": null en elección
+```
+
+`421` y no `409` porque `/respuestas` ya usa `409` para dos cosas distintas
+(`desconocido`, `destinatario-saturado`): un tercer significado sobre el mismo código hace que
+un `status == 409` pelado descarte respuestas válidas en silencio. `421` significa literalmente
+"le pediste a un servidor que no puede responder esto".
+
+`GET /health`, `GET /health/vivo` y `/raft/*` **nunca** contestan `421`.
+
+### Nada de nginx adelante del clúster
+
+Un proxy round-robin mandaría escrituras a un slave al azar. **El balanceador y los workers le
+hablan directo a cada nodo** y siguen al master ellos mismos: arrancan con la lista de los N,
+preguntan por `/health` quién manda, lo cachean, y se mudan cuando les llega un `421`. Toda la
+adaptación a la topología son tres cosas: una lista estática, una URL cacheada y reintento con
+backoff.
+
+### El protocolo, entre nodos
+
+```
+POST /raft/appendEntries   {termino, master, indicePrevio, terminoPrevio, entradas[], indiceCommit}
+                           vacío = heartbeat. ← {termino, exito, indiceCoincidente}
+                           ← {termino, exito: false, terminoConflicto, primerIndiceDelTermino}
+POST /raft/requestVote     {termino, candidato, ultimoIndiceLog, ultimoTerminoLog}
+                           ← {termino, votoConcedido}
+GET  /raft/estado          rol, término, índice de log y de commit (diagnóstico)
+```
+
+Tres reglas sostienen la corrección, y cada una vive en un solo lugar de `raft.py`:
+
+1. **Un voto por término, y sólo a un log al menos tan al día como el propio** (último término
+   primero, índice en el desempate). Es lo que impide que un nodo atrasado gane y se lleve
+   puestos pedidos ya confirmados.
+2. **Una entrada se compromete con la mayoría**, y el master sólo commitea por conteo las
+   entradas de *su* término; las anteriores viajan de arrastre.
+3. **Fencing por término**: cualquier mensaje con un término mayor degrada al receptor a slave
+   en el acto, esté en el rol que esté. Es lo que hace imposible que haya dos masters — un
+   master viejo que revive se autoexcluye sin que nadie tenga que detectarlo ni echarlo.
+
+`raft.py` no importa `threading`, `time` ni `http`: el tiempo entra como argumento de `tic()` y
+los mensajes se **devuelven** en vez de enviarse. Quien cierra ese lazo es `motor.py`. No es
+purismo: es lo que hace que los tests de elección sean deterministas en vez de una lotería
+contra el reloj de pared.
+
+---
+
 ## Por qué dos colas y no una
 
 Son dos flujos con dueños distintos. En `pedidos` hay N consumidores **compitiendo por el
@@ -89,7 +171,9 @@ y otra ya resolvió el pedido, la segunda se rechaza con `409 {"resultado": "des
 
 ## El contrato HTTP
 
-Todo es `POST` con JSON y respuesta JSON. Todo pide `X-Cola-Token`, menos `GET /health`.
+Todo es `POST` con JSON y respuesta JSON. Todo pide `X-Cola-Token`, menos `GET /health` y
+`GET /health/vivo`. El token **no es uno solo**: cada clase de ruta tiene el suyo (ver
+[Seguridad](#seguridad)).
 
 `tomar` es POST y no GET a propósito: saca el elemento de la cola, o sea que cambia el estado
 del servidor. Un GET que muta es lo que cualquier reintento automático de un cliente HTTP
@@ -294,6 +378,14 @@ Tres cosas que no son obvias y se pagan caras:
 | `COLA_PRESUPUESTO_MAXIMO` | `60` | Techo de `presupuestoMs` |
 | `COLA_INTERVALO_RECUPERADOR` | `0.25` | Cada cuánto corre el recuperador |
 | `COLA_LOGS` | `logs` | Directorio de la bitácora |
+| `COLA_PARES` | *(vacío)* | URLs de los nodos, separadas por coma. Vacío = nodo solo |
+| `COLA_URL` | `http://BIND:PUERTO` | Cómo lo ven los otros nodos. Es su identidad en el clúster |
+| `COLA_INSTANCIA` | `cola-PUERTO@CASA` | Sale en `/health` y en la bitácora |
+| `COLA_TOKEN_PUBLICADOR` | `COLA_TOKEN` | |
+| `COLA_TOKEN_CONSUMIDOR` | `COLA_TOKEN` | |
+| `COLA_TOKEN_CLUSTER` | `COLA_TOKEN` | |
+| `RAFT_HEARTBEAT_MS` | `150` | Cada cuánto late el master |
+| `RAFT_ELECCION_TIMEOUT_MS` | `600` | Silencio antes de postularse, más un jitter aleatorio |
 
 ## Seguridad
 
@@ -304,29 +396,54 @@ en otras casas. Sin token, cualquiera que la alcance puede publicar pedidos fals
 Las tres barreras, y hacen falta las tres:
 
 1. `ufw`: sólo entra por `tailscale0`.
-2. `COLA_TOKEN` en `X-Cola-Token`, el mismo en el balanceador y en cada worker.
+2. El token que corresponda en `X-Cola-Token` (ver abajo).
 3. El contenedor corre con un usuario sin privilegios (uid 1000), sin el socket de Docker y
    sin `--privileged`.
 
-**Pendiente:** un token para el balanceador y otro para los workers. Publicar un pedido y
-consumirlo no son el mismo permiso, y hoy un worker comprometido puede inyectar pedidos.
+### Tres tokens, porque no son el mismo permiso
+
+| Token | Abre | Lo tiene |
+| :--- | :--- | :--- |
+| `COLA_TOKEN_PUBLICADOR` | `POST /pedidos`, `POST /respuestas/tomar`, `GET /estado` | el balanceador |
+| `COLA_TOKEN_CONSUMIDOR` | `POST /pedidos/tomar`, `POST /pedidos/devolver`, `POST /respuestas` | los workers |
+| `COLA_TOKEN_CLUSTER` | `/raft/*` | sólo los nodos de cola |
+
+Los tres caen a `COLA_TOKEN` cuando no se definen, así que un despliegue existente migra sin
+tocarle la configuración.
+
+El tercero no es simetría burocrática: **sin él, cualquiera que alcance el puerto puede
+postularse candidato o inyectar entradas en el log**, que es la diferencia entre replicar y ser
+replicado por un desconocido. Y el corte publicador/consumidor importa porque un worker
+comprometido con un token único podría inyectar pedidos falsos, no sólo consumirlos.
 
 ## Pruebas
 
 ```bash
-./.venv/bin/python -m unittest discover -s ../tests -p "test_colas.py" -v
-./.venv/bin/python -m unittest discover -s ../tests -p "test_servidor_cola.py" -v
+python3 -m unittest discover -s tests -v      # sólo biblioteca estándar, sin pytest
 ```
 
-`test_colas.py` prueba la estructura sin HTTP; `test_servidor_cola.py` levanta el servidor en
-un puerto libre y lo habla con `ClienteCola`, que es el cliente real del balanceador — así una
-prueba verde quiere decir que los dos extremos hablan el mismo idioma, no que cada uno habla
-consigo mismo.
+| | Qué prueba | Cómo |
+| :--- | :--- | :--- |
+| `test_raft.py` | la máquina de estados sola | reloj falso y bus en memoria; **sin `time` ni `sleep`** |
+| `test_servidor_cluster.py` | la superficie HTTP: tokens, `421`, `/health` | un nodo en un puerto libre, hablado con `urllib` |
+| `test_cluster_raft.py` | el cableado real: elección, failover, puesta al día | 3 nodos en proceso, cada uno con su copia del módulo |
+
+`test_raft.py` no puede importar `time` ni llamar a `sleep`: el tiempo entra por
+`avanzar(ms)` contra un reloj falso, y "un nodo lento" es un `threading.Event` que controla el
+test. No es preferencia de estilo — es lo único que hace que los tests de elección no sean una
+lotería contra el reloj de pared.
+
+En los tests de integración no se afirma que algo pasó *dentro de* una ventana de tiempo: se
+consulta una condición con un techo generoso. Un techo ajustado es cómo una suite se vuelve
+intermitente en una máquina cargada.
 
 ## Lo que no hace, y no por olvido
 
-- **No persiste.** El contrato con el cliente es sincrónico: cuando se volvería a replicar el
-  pedido, el cliente ya se fue. Reiniciar el contenedor tira lo que estaba esperando.
+- **No persiste en disco.** El log vive en memoria: la durabilidad la da la **replicación**, no
+  el disco. Un pedido confirmado sobrevive a la caída de *un* nodo porque lo tienen 2 de 3, no
+  porque esté escrito en algún lado. Apagar los tres a la vez tira lo que estaba esperando, y
+  es una decisión consciente: es lo que hace Kafka en su camino rápido, donde `acks=all` sobre
+  varias réplicas reemplaza al `fsync` por mensaje.
 - **No reparte.** No hay round-robin ni pesos: el worker libre toma el próximo. El reparto
   sale solo de la velocidad de cada réplica.
 - **No sabe qué es una réplica.** Un consumidor es un string. Puede ser Python, Java o `curl`.

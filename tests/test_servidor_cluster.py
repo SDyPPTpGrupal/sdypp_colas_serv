@@ -17,8 +17,6 @@ import sys
 import tempfile
 import threading
 import unittest
-import urllib.error
-import urllib.request
 from http.server import ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -26,6 +24,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import servidor  # noqa: E402
 from colas import Sistema  # noqa: E402
 from raft import NodoRaft  # noqa: E402
+
+from ayuda import pedir_http, silenciar_bitacora  # noqa: E402
 
 BALANCEADOR = "balanceador@casa-tomas"
 
@@ -56,7 +56,7 @@ class ConNodo(unittest.TestCase):
 
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        servidor.DIRECTORIO_LOGS = tmp.name
+        silenciar_bitacora(servidor, tmp.name, "prueba")
 
         self.http = ThreadingHTTPServer(("127.0.0.1", 0), servidor.Manejador)
         self.http.daemon_threads = True
@@ -74,19 +74,7 @@ class ConNodo(unittest.TestCase):
 
     # ------------------------------------------------------------------ http
     def pedir(self, ruta, cuerpo=None, token=None, metodo="POST"):
-        cabeceras = {"Content-Type": "application/json"}
-        if token is not None:
-            cabeceras["X-Cola-Token"] = token
-        datos = json.dumps(cuerpo or {}).encode() if metodo == "POST" else None
-        pedido = urllib.request.Request(self.url + ruta, data=datos,
-                                        method=metodo, headers=cabeceras)
-        try:
-            with urllib.request.urlopen(pedido, timeout=5) as r:
-                crudo = r.read()
-                return r.status, json.loads(crudo) if crudo else {}
-        except urllib.error.HTTPError as e:
-            crudo = e.read()
-            return e.code, json.loads(crudo) if crudo else {}
+        return pedir_http(self.url, ruta, cuerpo, metodo, token, timeout=5)
 
     def obtener(self, ruta, token=None):
         return self.pedir(ruta, token=token, metodo="GET")
