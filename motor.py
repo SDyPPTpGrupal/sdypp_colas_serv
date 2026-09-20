@@ -19,10 +19,13 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 
 TIMEOUT_PAR_S = 2.0
-HILOS_DE_ENVIO = 4
+# Cuántos mensajes se le guardan a un par que no contesta antes de empezar a
+# tirar los viejos. Chico a propósito: si un par acumuló esto, lo que necesita
+# es el estado de AHORA, no la cola de lo que se perdió.
+COLA_POR_PAR = 8
 LATIDO_S = 0.5              # techo de toda espera: un notify perdido cuesta 0,5 s, no un cuelgue
 
 # Resultados de `proponer_y_esperar`.
@@ -70,8 +73,23 @@ class Motor:
         self.aplicador = aplicador
         self.intervalo_recuperador_s = intervalo_recuperador_s
 
-        self.salientes = Queue()
+        # Una cola por par, no una sola compartida. Con una cola común, un par
+        # muerto se lleva puestos a los sanos: cada intento contra él cuesta un
+        # timeout entero (bastante más caro que un `connection refused` cuando
+        # el nombre ya no resuelve, que es lo que pasa apenas el contenedor
+        # desaparece), y los mensajes dirigidos a los nodos que SÍ contestan
+        # quedan encolados atrás. Eso alcanza para que los votos lleguen después
+        # del timeout de elección y el clúster no converja nunca: se elige en un
+        # término, nadie junta mayoría a tiempo, se reelige en el siguiente, y
+        # el término sube sin parar mientras el servicio está caído.
+        #
+        # Es head-of-line blocking, y no se arregla con más hilos: se arregla
+        # con que la lentitud de un par no sea compartida.
+        self.salientes = {par: Queue(maxsize=COLA_POR_PAR) for par in raft.pares}
         self._activo = False
+        # Peers we have already reported as unreachable. Only the transition is
+        # worth a line; see `_bucle_envio`.
+        self._mudos = set()
         self._hilos = []
 
         # Candado 1 del orden de la Decisión 8. Se toma por microsegundos, para
@@ -107,9 +125,9 @@ class Motor:
             self._hilos.append(threading.Thread(target=self._bucle_reloj,
                                                 name="raft-tic", daemon=True))
         self._hilos += [
-            threading.Thread(target=self._bucle_envio, name=f"raft-envio-{i}",
-                             daemon=True)
-            for i in range(HILOS_DE_ENVIO)
+            threading.Thread(target=self._bucle_envio, args=(par,),
+                             name=f"raft-envio-{par}", daemon=True)
+            for par in self.salientes
         ]
         if self.aplicador is not None:
             self._hilos.append(threading.Thread(target=self._bucle_aplicador,
@@ -145,12 +163,30 @@ class Motor:
     def enviar(self, mensajes):
         """Queue outbound messages. Called by the ticker and by HTTP handlers."""
         for mensaje in mensajes or []:
-            self.salientes.put(mensaje)
+            cola = self.salientes.get(mensaje.destino)
+            if cola is None:                    # no es un par: nada que hacer
+                continue
+            try:
+                cola.put_nowait(mensaje)
+            except Full:
+                # La cola de ese par está llena, o sea que no viene contestando.
+                # Se tira el mensaje MÁS VIEJO y entra el nuevo: un latido
+                # viejo no sirve para nada —lleva un indiceCommit atrasado y el
+                # siguiente lo reemplaza— y un requestVote viejo es de un
+                # término que ya pasó. Acumularlos sólo agrega latencia al
+                # momento en que el par vuelva.
+                try:
+                    cola.get_nowait()
+                    cola.put_nowait(mensaje)
+                except (Empty, Full):
+                    pass
 
-    def _bucle_envio(self):
+    def _bucle_envio(self, par):
+        """Un hilo por par. Lo que tarde uno no demora a los demás."""
+        cola = self.salientes[par]
         while self._activo:
             try:
-                mensaje = self.salientes.get(timeout=0.2)
+                mensaje = cola.get(timeout=0.2)
             except Empty:
                 continue
             try:
@@ -159,7 +195,20 @@ class Motor:
                 # A peer being unreachable is the normal case this whole design
                 # exists for, not an error worth a stack trace. The election
                 # timeout is what reacts to it.
-                self.registrar("raft envio", 503, f"{mensaje.destino}: {e}")
+                #
+                # Only the transition is logged, in both directions. A heartbeat
+                # every RAFT_HEARTBEAT_MS against a dead peer would otherwise
+                # write several lines per second to the bitácora for as long as
+                # it stays down — which is exactly when the log has to stay
+                # readable, and when the disk it lands on is least worth
+                # filling.
+                if mensaje.destino not in self._mudos:
+                    self._mudos.add(mensaje.destino)
+                    self.registrar("raft envio", 503, f"{mensaje.destino} no responde: {e}")
+            else:
+                if mensaje.destino in self._mudos:
+                    self._mudos.discard(mensaje.destino)
+                    self.registrar("raft envio", 200, f"{mensaje.destino} responde de nuevo")
 
     # -------------------------------------------------------------- transport
     def _entregar(self, mensaje):
@@ -198,8 +247,13 @@ class Motor:
 
     # ------------------------------------------------------- proponer y esperar
     def _ids_de(self, operacion, payload):
-        """Qué pedido nombra una entrada. Sólo `tomar` compite por uno."""
-        if operacion == "tomar" and payload.get("id"):
+        """Qué pedido o respuesta nombra una entrada, cuando hay competencia.
+
+        `tomar` compite por un pedido entre varios workers, y
+        `retirar-respuesta` compite por una respuesta entre los recolectores
+        del balanceador, que son varios hilos con su propio long-poll abierto.
+        """
+        if operacion in ("tomar", "retirar-respuesta") and payload.get("id"):
             return {payload["id"]}
         return set()
 
