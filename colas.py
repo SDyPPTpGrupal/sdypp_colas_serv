@@ -313,6 +313,21 @@ class ColaPedidos:
         with self._hay:
             return id in self._en_vuelo
 
+    def obtener(self, id):
+        """El pedido, esté esperando o en vuelo. None si no está."""
+        with self._hay:
+            pedido = self._en_vuelo.get(id)
+            return pedido if pedido is not None else self._buscar(id)
+
+    def esperar_cambio(self, timeout):
+        """El long-poll de siempre. Despierta cuando el paso de aplicación avisa.
+
+        Los que esperan se despiertan sólo con estado ya comprometido, porque el
+        `notify` sale del aplicador y el aplicador sólo toca entradas commiteadas.
+        """
+        with self._hay:
+            self._hay.wait(timeout=timeout)
+
     def estado(self):
         ahora = time.monotonic()
         with self._hay:
@@ -415,6 +430,20 @@ class ColaRespuestas:
             # distintos y el que despierte puede no ser el dueño de esta.
             self._hay.notify_all()
             return True
+
+    def espiar(self, destinatario):
+        """La próxima respuesta de ese destinatario, sin sacarla. None si no hay.
+
+        La saca el paso de aplicación, no el handler: el handler sólo necesita
+        saber qué va a salir para poder devolverla cuando la entrada commitee.
+        """
+        with self._hay:
+            pendientes = self._por_destinatario.get(destinatario)
+            return pendientes[0][1] if pendientes else None
+
+    def esperar_cambio(self, timeout):
+        with self._hay:
+            self._hay.wait(timeout=timeout)
 
     def saturado(self, destinatario):
         """¿Rechazaría una respuesta más para ese destinatario?
@@ -609,6 +638,21 @@ class Sistema:
 
     def pedido_en_vuelo(self, id):
         return self.pedidos.en_vuelo(id)
+
+    def obtener_pedido(self, id):
+        return self.pedidos.obtener(id)
+
+    def espiar_respuesta(self, destinatario):
+        return self.respuestas.espiar(destinatario)
+
+    def esperar_pedidos(self, timeout):
+        self.pedidos.esperar_cambio(timeout)
+
+    def esperar_respuestas(self, timeout):
+        self.respuestas.esperar_cambio(timeout)
+
+    def saturado(self, destinatario):
+        return self.respuestas.saturado(destinatario)
 
     def inspeccionar_frente(self, ahora_ms, excluidos=()):
         return self.pedidos.inspeccionar_frente(ahora_ms, excluidos)

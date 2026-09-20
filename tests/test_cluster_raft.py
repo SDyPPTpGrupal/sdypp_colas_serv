@@ -27,6 +27,7 @@ from http.server import ThreadingHTTPServer
 RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, RAIZ)
 
+from aplicar import Aplicador  # noqa: E402
 from colas import Sistema  # noqa: E402
 from motor import Motor  # noqa: E402
 from raft import NodoRaft  # noqa: E402
@@ -80,8 +81,12 @@ class NodoDePrueba:
 
     def arrancar(self):
         mod = self.mod
+        mod.APLICADOR = Aplicador(mod.SISTEMA)
         self.motor = Motor(mod.RAFT, token=TOKEN, lock=mod.LOCK_RAFT,
-                           intervalo_ms=max(10, HEARTBEAT_MS // 3))
+                           intervalo_ms=max(10, HEARTBEAT_MS // 3),
+                           sistema=mod.SISTEMA, aplicador=mod.APLICADOR,
+                           intervalo_recuperador_s=0.2)
+        mod.MOTOR = self.motor
         mod.DESPACHAR = self.motor.enviar
         self.motor.arrancar()
         self.hilo = threading.Thread(target=self.http.serve_forever, daemon=True)
@@ -161,7 +166,20 @@ class ConCluster(unittest.TestCase):
         return [n for n in self.nodos if n.rol == "master"]
 
     def esperar_un_master(self, techo=TECHO_S):
-        return esperar_a(lambda: (self.masters() or [None])[0], techo=techo)
+        """Un master que además ya terminó su catch-up, o sea, listo para atender.
+
+        Un master recién electo contesta `503 {"error": "recuperando"}` en las
+        rutas de datos hasta barrer el log que heredó. Esperar sólo el rol deja
+        una ventana en la que el nodo es master y todavía no atiende — real, y
+        no es lo que estos tests quieren medir.
+        """
+        return esperar_a(lambda: next(
+            (n for n in self.masters() if not n.motor.recuperando), None), techo=techo)
+
+    def esperar_master_listo(self, entre, techo=TECHO_S):
+        return esperar_a(lambda: next(
+            (n for n in entre if n.rol == "master" and not n.motor.recuperando), None),
+            techo=techo)
 
     def pedido(self, id="p1"):
         return {"id": id, "operacion": "GET /personas", "parametros": {},
@@ -235,33 +253,53 @@ class TestRedireccionReal(ConCluster):
 # 3.17 — the 202 must wait for a majority (red until slice 4b)
 # =====================================================================
 class TestCommitPorMayoria(ConCluster):
+    """Spec `queue-service-api` — "only acknowledged after majority commit".
 
-    @unittest.expectedFailure
-    def test_el_202_no_sale_antes_de_la_mayoria(self):
-        """Spec `queue-service-api` — "only acknowledged after majority commit".
+    The slow-slave variant (holding `/raft/appendEntries` on an Event) turned out
+    not to be deterministic here: by the time the handler is patched, the append
+    that carries the entry may already be in flight, so the test could pass or
+    fail on scheduling. Killing the slaves outright tests the same property —
+    no majority is reachable — and cannot race.
+    """
 
-        EXPECTED RED UNTIL SLICE 4b. Today `POST /pedidos` answers as soon as the
-        master has enqueued locally: the propose-and-wait that gates the reply on
-        `indiceCommit` is `motor.py`'s half of slice 4. Until then the `202` is a
-        promise the cluster has not yet made, and this test is the reminder.
-        """
+    def test_sin_mayoria_alcanzable_no_hay_202(self):
         master = self.esperar_un_master()
+
         for otro in self.nodos:
             if otro is not master:
-                otro.demorar_appends()
-        self.addCleanup(lambda: [n.soltar_appends() for n in self.nodos])
+                otro.parar()
 
-        respondio = threading.Event()
+        codigo, _ = master.pedir("/pedidos", self.pedido(), timeout=TECHO_S)
 
-        def publicar():
-            master.pedir("/pedidos", self.pedido(), timeout=TECHO_S)
-            respondio.set()
+        self.assertNotEqual(codigo, 202,
+                            "the 202 was sent with both slaves down: no majority "
+                            "could possibly hold that entry")
 
-        threading.Thread(target=publicar, daemon=True).start()
+    def test_con_un_slave_vivo_si_hay_202(self):
+        """The mirror: master + 1 slave is a majority of 3, so the reply comes."""
+        master = self.esperar_un_master()
 
-        llego_temprano = respondio.wait(1.0)
-        self.assertFalse(llego_temprano,
-                         "the 202 was sent before any slave acknowledged")
+        otros = [n for n in self.nodos if n is not master]
+        otros[0].parar()
+
+        codigo, _ = master.pedir("/pedidos", self.pedido(), timeout=TECHO_S)
+
+        self.assertEqual(codigo, 202)
+
+    def test_lo_confirmado_queda_en_el_log_del_slave(self):
+        """A committed entry is on more than one machine — that is the point."""
+        master = self.esperar_un_master()
+
+        codigo, _ = master.pedir("/pedidos", self.pedido("sobrevive"), timeout=TECHO_S)
+        self.assertEqual(codigo, 202)
+
+        otro = next(n for n in self.nodos if n is not master)
+        esperar_a(lambda: otro.mod.RAFT.indice_ultimo >= master.mod.RAFT.indice_ultimo)
+
+        ids = [e.payload.get("id") for e in otro.mod.RAFT.log
+               if e.operacion == "encolar"]
+        self.assertIn("sobrevive", ids,
+                      "the pedido the client was promised is not on the slave")
 
 
 # =====================================================================
@@ -277,7 +315,7 @@ class TestFailover(ConCluster):
         primero.parar()
         vivos = [n for n in self.nodos if n is not primero]
 
-        segundo = esperar_a(lambda: next((n for n in vivos if n.rol == "master"), None))
+        segundo = self.esperar_master_listo(vivos)
 
         self.assertIsNotNone(segundo, "no new master after the old one died")
         self.assertIsNot(segundo, primero)
@@ -289,7 +327,7 @@ class TestFailover(ConCluster):
         primero.parar()
         vivos = [n for n in self.nodos if n is not primero]
 
-        segundo = esperar_a(lambda: next((n for n in vivos if n.rol == "master"), None))
+        segundo = self.esperar_master_listo(vivos)
         otro = next(n for n in vivos if n is not segundo)
         esperar_a(lambda: otro.salud().get("masterConocido") == segundo.url)
 
@@ -299,7 +337,7 @@ class TestFailover(ConCluster):
         primero = self.esperar_un_master()
         primero.parar()
         vivos = [n for n in self.nodos if n is not primero]
-        segundo = esperar_a(lambda: next((n for n in vivos if n.rol == "master"), None))
+        segundo = self.esperar_master_listo(vivos)
 
         codigo, _ = segundo.pedir("/pedidos", self.pedido("despues-de-la-caida"))
 
@@ -329,6 +367,87 @@ class TestPuestaAlDia(ConCluster):
 
         self.assertTrue(alcanzado,
                         f"the reachable slave never caught up to {indice_master}")
+
+
+# =====================================================================
+# 4.17-4.19 — vencimiento sólo en el master, y catch-up post-elección
+# =====================================================================
+class TestVencimientoYCatchUp(ConCluster):
+    """Spec `queue-log-application` — Master-Only Lazy Expiry, Post-Election Catch-Up."""
+
+    def test_un_slave_no_puede_vencer_nada_por_su_cuenta(self):
+        """Scenario: a slave never independently expires a pedido.
+
+        No hace falta vigilarlo: un slave no puede proponer, así que su barrido
+        no tiene por dónde salir. La garantía es estructural, no una regla que
+        alguien tenga que respetar.
+        """
+        master = self.esperar_un_master()
+        slave = next(n for n in self.nodos if n is not master)
+
+        resultado = slave.motor.proponer_y_esperar("expirar", {"reencolar": [],
+                                                               "fallar": []}, 0)
+
+        self.assertEqual(resultado, "destituido")
+
+    def test_el_master_recien_electo_contesta_503_y_no_421(self):
+        """Scenario 4.19: durante el catch-up las rutas de datos dan 503.
+
+        503 y no 421 porque este nodo SÍ es el master: no hay a dónde redirigir,
+        sólo hay que esperar a que termine de barrer lo que heredó.
+        """
+        master = self.esperar_un_master()
+        # Simular un mandato nuevo sin catch-up hecho, que es exactamente el
+        # estado de un master recién coronado.
+        master.motor.recuperado_hasta_termino = -1
+
+        codigo, cuerpo = master.pedir("/pedidos", self.pedido())
+
+        self.assertEqual(codigo, 503)
+        self.assertEqual(cuerpo, {"error": "recuperando"})
+
+    def test_el_catch_up_corre_una_vez_por_eleccion(self):
+        """Scenario: catch-up runs exactly once per election win."""
+        master = self.esperar_un_master()
+        termino = master.mod.RAFT.termino_actual
+
+        self.assertEqual(master.motor.recuperado_hasta_termino, termino)
+        self.assertFalse(master.motor.recuperando)
+
+        for _ in range(3):
+            master.pedir("/pedidos", self.pedido())
+        self.assertEqual(master.motor.recuperado_hasta_termino, termino,
+                         "catch-up re-ran on a normal request")
+
+    def test_el_master_nuevo_no_entrega_lo_que_murio_sin_lider(self):
+        """Scenario: a fresh master does not hand out a pedido that died during
+        the election window.
+
+        La reserva vence mientras no hay master. Si el nuevo sirviera desde el
+        log sin barrerlo, le daría a un worker un pedido cuyo dueño anterior ya
+        está muerto, como si siguiera vivo y reservado.
+        """
+        master = self.esperar_un_master()
+        self.assertEqual(master.pedir("/pedidos", self.pedido("p-huerfano"))[0], 202)
+        codigo, tomado = master.pedir("/pedidos/tomar",
+                                      {"consumidor": "replica-que-se-muere", "espera": 2})
+        self.assertEqual(codigo, 200)
+        self.assertEqual(tomado["id"], "p-huerfano")
+
+        master.parar()
+        vivos = [n for n in self.nodos if n is not master]
+        segundo = self.esperar_master_listo(vivos)
+        self.assertIsNotNone(segundo, "no new master")
+
+        # Tras el catch-up, el pedido idempotente volvió a la cola y se entrega
+        # con intento 2 — nunca como una reserva viva de la réplica muerta.
+        codigo, servido = segundo.pedir("/pedidos/tomar",
+                                        {"consumidor": "replica-nueva", "espera": 3})
+
+        self.assertEqual(codigo, 200)
+        self.assertEqual(servido["id"], "p-huerfano")
+        self.assertGreaterEqual(servido["intento"], 2,
+                                "served as if it were still a live first attempt")
 
 
 if __name__ == "__main__":

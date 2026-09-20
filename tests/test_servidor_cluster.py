@@ -22,7 +22,9 @@ from http.server import ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import servidor  # noqa: E402
+from aplicar import Aplicador  # noqa: E402
 from colas import Sistema  # noqa: E402
+from motor import Motor  # noqa: E402
 from raft import NodoRaft  # noqa: E402
 
 from ayuda import pedir_http, silenciar_bitacora  # noqa: E402
@@ -71,6 +73,16 @@ class ConNodo(unittest.TestCase):
             yo=self.url, pares=list(self.pares),
             reloj=lambda: 0, azar=_AzarFijo(),
             timeout_eleccion_ms=150, heartbeat_ms=50)
+        servidor.APLICADOR = Aplicador(servidor.SISTEMA)
+        servidor.MOTOR = Motor(servidor.RAFT, lock=servidor.LOCK_RAFT,
+                               sistema=servidor.SISTEMA,
+                               aplicador=servidor.APLICADOR)
+        servidor.DESPACHAR = servidor.MOTOR.enviar
+        # Sin ticker: estos tests fijan el rol a mano y una elección se lo
+        # pisaría. El aplicador sí corre, porque es quien escribe el estado.
+        servidor.MOTOR.arrancar(reloj=False)
+        self.addCleanup(servidor.MOTOR.parar)
+        self.marcar_recuperado()
 
     # ------------------------------------------------------------------ http
     def pedir(self, ruta, cuerpo=None, token=None, metodo="POST"):
@@ -80,10 +92,20 @@ class ConNodo(unittest.TestCase):
         return self.pedir(ruta, token=token, metodo="GET")
 
     # ------------------------------------------------------------ raft state
+    def marcar_recuperado(self):
+        """Dar el catch-up por hecho para el mandato en curso.
+
+        Sin el ticker nadie lo corre, y un master que no barrió su log contesta
+        `503 recuperando` en las rutas de datos — correcto en producción, pero
+        acá el escenario es un master ya operativo.
+        """
+        servidor.MOTOR.recuperado_hasta_termino = servidor.RAFT.termino_actual
+
     def hacerme_master(self):
         servidor.RAFT.rol = "master"
         servidor.RAFT.master_conocido = self.url
         servidor.RAFT.termino_actual = 4
+        self.marcar_recuperado()
 
     def hacerme_slave(self, master="http://127.0.0.1:9101"):
         servidor.RAFT.rol = "slave"

@@ -43,8 +43,9 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from aplicar import Aplicador
 from colas import Pedido, Sistema
-from motor import Motor
+from motor import COMPROMETIDO, DESTITUIDO, Motor
 from raft import Entrada, NodoRaft
 
 # --- Configuración ---------------------------------------------------------
@@ -123,6 +124,10 @@ PARES = [u.strip().rstrip("/") for u in os.environ.get("COLA_PARES", "").split("
 RAFT_HEARTBEAT_MS = int(os.environ.get("RAFT_HEARTBEAT_MS", "150"))
 RAFT_ELECCION_TIMEOUT_MS = int(os.environ.get("RAFT_ELECCION_TIMEOUT_MS", "600"))
 
+# Cuánto espera una escritura a que la mayoría tenga su entrada. Es un techo,
+# no una latencia esperada: en un clúster sano cuesta un round-trip.
+ESPERA_COMMIT = float(os.environ.get("COLA_ESPERA_COMMIT", "5"))
+
 
 SISTEMA = Sistema(COTA_PEDIDOS, COTA_RESPUESTAS, RESERVA, TTL_RESPUESTAS)
 ARRANCADO = None
@@ -136,8 +141,13 @@ RAFT = NodoRaft(yo=MI_URL, pares=PARES, reloj=lambda: int(time.monotonic() * 100
 # deterministas. El candado vive acá, que es donde está la concurrencia real.
 LOCK_RAFT = threading.RLock()
 
-# Lo setea `motor.py` cuando hay red que atender. En un nodo solo nunca hay
-# mensajes salientes, así que queda en None y no se usa.
+APLICADOR = Aplicador(SISTEMA)
+
+# Siempre hay motor, incluso con un nodo: es el único que aplica entradas, y un
+# nodo solo es mayoría de uno, así que sus propuestas se comprometen en el acto.
+MOTOR = None
+
+# Lo setea `motor.py` cuando hay red que atender.
 DESPACHAR = None
 
 
@@ -275,6 +285,23 @@ class Manejador(BaseHTTPRequestHandler):
     def soy_master(self):
         return RAFT.rol == "master"
 
+    def proponer(self, operacion, payload, limite):
+        """Agrega la entrada y espera la mayoría. False si ya contestó por su cuenta.
+
+        Los tres desenlaces que no son "comprometido" tienen respuesta propia, y
+        ninguno deja al que llamó esperando: destituido contesta 421 con el
+        master nuevo, y vencido contesta 204, que en estas rutas ya significa
+        "ahora no hay nada" y no obliga a cambiar nada del contrato.
+        """
+        resultado = MOTOR.proponer_y_esperar(operacion, payload, limite)
+        if resultado == COMPROMETIDO:
+            return True
+        if resultado == DESTITUIDO:
+            self.redirigir()
+        else:
+            self.responder(204, {})
+        return False
+
     def redirigir(self):
         """421 Misdirected Request: literally "you asked a server that cannot
         answer this". Distinct from the two `409`s on /respuestas, so a client
@@ -320,12 +347,23 @@ class Manejador(BaseHTTPRequestHandler):
             cliente=cuerpo.get("cliente"),
             reloj_ms=SISTEMA.reloj_ms,
         )
-        if not SISTEMA.publicar_pedido(pedido):
-            estado = SISTEMA.pedidos.estado()
+        # La cota se mira antes de agregar la entrada: llenar el log con pedidos
+        # que se van a rechazar es replicar basura.
+        estado = SISTEMA.pedidos.estado()
+        if estado["esperando"] >= estado["cota"]:
             bitacora("POST /pedidos", 503,
                      f"req={pedido.id} cola llena ({estado['esperando']}/{estado['cota']})")
             return self.responder(503, {"error": "cola llena", "esperando": estado["esperando"],
                                         "cota": estado["cota"]})
+
+        payload = {"id": pedido.id, "operacion": operacion,
+                   "parametros": pedido.parametros, "idempotente": pedido.idempotente,
+                   "destinatario": destinatario, "cliente": pedido.cliente,
+                   "venceEnMs": pedido.vence_en_ms, "encoladoEnMs": pedido.encolado_en_ms}
+        # El 202 sale DESPUÉS de la mayoría: es la promesa de que ese pedido
+        # sobrevive a la caída de un nodo, y antes del commit no se puede hacer.
+        if not self.proponer("encolar", payload, time.monotonic() + ESPERA_COMMIT):
+            return
         bitacora("POST /pedidos", 202, f"req={pedido.id} {operacion} para={destinatario}")
         self.responder(202, {"id": pedido.id, "encolado": True})
 
@@ -340,13 +378,57 @@ class Manejador(BaseHTTPRequestHandler):
         consumidor = cuerpo.get("consumidor")
         if not consumidor:
             return self.responder(400, {"error": "falta consumidor"})
-        pedido = SISTEMA.tomar_pedido(consumidor, acotar_espera(cuerpo.get("espera", ESPERA_MAXIMA)))
-        if pedido is None:
-            return self.responder(204, {})
-        bitacora("POST /pedidos/tomar", 200,
-                 f"req={pedido.id} {pedido.operacion} tomado={consumidor} "
-                 f"intento={len(pedido.intentos)}")
-        self.responder(200, pedido.como_json())
+
+        limite = time.monotonic() + acotar_espera(cuerpo.get("espera", ESPERA_MAXIMA))
+        SISTEMA.pedidos.vistos[consumidor] = time.monotonic()
+
+        primera = True
+        while primera or time.monotonic() < limite:
+            # Se mira siempre al menos una vez: `espera: 0` significa "fijate y
+            # contestame ya", no "no te fijes".
+            primera = False
+            ahora_ms = SISTEMA.reloj_ms()
+            clase, dato = SISTEMA.inspeccionar_frente(ahora_ms, MOTOR.ids_propuestos())
+
+            if clase == "vacio":
+                SISTEMA.esperar_pedidos(min(limite - time.monotonic(), 0.5))
+                continue
+
+            if clase == "vencidos":
+                # El frente está muerto pero todavía no se comprometió su
+                # vencimiento. Entregarlo sería gastarle una réplica a algo que
+                # nadie va a leer, así que se espera a que el `expirar` commitee.
+                resultado = MOTOR.barrer_vencidos(espera_s=max(0.05, limite - time.monotonic()))
+                if resultado == DESTITUIDO:
+                    return self.redirigir()
+                continue
+
+            pedido = SISTEMA.obtener_pedido(dato)
+            if pedido is None:
+                continue                      # se lo llevaron entre medio
+            payload = {"id": dato, "consumidor": consumidor,
+                       "reservadoHastaMs": min(ahora_ms + int(RESERVA * 1000),
+                                               pedido.vence_en_ms)}
+            # El presupuesto del long-poll dice cuánto esperar a que APAREZCA
+            # trabajo, no cuánto esperar a que se confirme la reserva. Una vez
+            # propuesta, hay que esperarla: abandonarla no la cancela —se
+            # commitea igual y deja el pedido reservado para un worker que ya
+            # recibió 204, perdido hasta que venza la reserva.
+            resultado = MOTOR.proponer_y_esperar(
+                "tomar", payload, max(limite, time.monotonic() + ESPERA_COMMIT))
+            if resultado == DESTITUIDO:
+                return self.redirigir()
+            if resultado != COMPROMETIDO:
+                break
+            entregado = SISTEMA.obtener_pedido(dato)
+            if entregado is None or not SISTEMA.pedido_en_vuelo(dato):
+                continue                      # perdimos la carrera, a mirar de nuevo
+            bitacora("POST /pedidos/tomar", 200,
+                     f"req={entregado.id} {entregado.operacion} tomado={consumidor} "
+                     f"intento={len(entregado.intentos)}")
+            return self.responder(200, entregado.como_json())
+
+        self.responder(204, {})
 
     def devolver_pedido(self, cuerpo):
         """El worker lo suelta a propósito: se está apagando o no lo puede atender.
@@ -359,8 +441,11 @@ class Manejador(BaseHTTPRequestHandler):
         id = cuerpo.get("id")
         if not id:
             return self.responder(400, {"error": "falta id"})
-        if not SISTEMA.devolver_pedido(id, cuerpo.get("consumidor")):
+        if not SISTEMA.pedido_en_vuelo(id):
             return self.responder(409, {"resultado": "no-estaba-en-vuelo"})
+        payload = {"id": id, "consumidor": cuerpo.get("consumidor")}
+        if not self.proponer("devolver", payload, time.monotonic() + ESPERA_COMMIT):
+            return
         bitacora("POST /pedidos/devolver", 200, f"req={id} lo soltó {cuerpo.get('consumidor')}")
         self.responder(200, {"resultado": "devuelto"})
 
@@ -375,14 +460,25 @@ class Manejador(BaseHTTPRequestHandler):
         contenido = cuerpo.get("contenido")
         if contenido is not None and not isinstance(contenido, dict):
             return self.responder(400, {"error": "contenido tiene que ser un objeto"})
-        aceptada, motivo = SISTEMA.responder(id, str(estado), contenido or {},
-                                             cuerpo.get("atendidoPor"), cuerpo.get("app"))
+        # Los dos rechazos se deciden acá y no viajan por el log: una respuesta
+        # que se descarta no es una mutación que haya que replicar.
+        pedido = SISTEMA.obtener_pedido(id)
+        aceptada, motivo = True, "entregada"
+        if pedido is None:
+            aceptada, motivo = False, "desconocido"
+        elif SISTEMA.saturado(pedido.destinatario):
+            aceptada, motivo = False, "destinatario-saturado"
         if not aceptada:
             # "desconocido" es el caso normal de una respuesta repetida: la
             # réplica lenta contestó después de que otra ya lo resolvió. No es
             # un error del que responde, así que se registra pero no se grita.
             bitacora("POST /respuestas", 409, f"req={id} descartada: {motivo}")
             return self.responder(409, {"resultado": motivo})
+
+        payload = {"id": id, "estado": str(estado), "contenido": contenido or {},
+                   "atendidoPor": cuerpo.get("atendidoPor"), "app": cuerpo.get("app")}
+        if not self.proponer("responder", payload, time.monotonic() + ESPERA_COMMIT):
+            return
         bitacora("POST /respuestas", 202,
                  f"req={id} {estado} de={cuerpo.get('atendidoPor') or '?'}")
         self.responder(202, {"resultado": "entregada"})
@@ -392,11 +488,26 @@ class Manejador(BaseHTTPRequestHandler):
         destinatario = cuerpo.get("destinatario")
         if not destinatario:
             return self.responder(400, {"error": "falta destinatario"})
-        respuesta = SISTEMA.tomar_respuesta(destinatario,
-                                            acotar_espera(cuerpo.get("espera", ESPERA_MAXIMA)))
-        if respuesta is None:
-            return self.responder(204, {})
-        self.responder(200, respuesta)
+        limite = time.monotonic() + acotar_espera(cuerpo.get("espera", ESPERA_MAXIMA))
+        primera = True
+        while primera or time.monotonic() < limite:
+            primera = False
+            respuesta = SISTEMA.espiar_respuesta(destinatario)
+            if respuesta is None:
+                SISTEMA.esperar_respuestas(min(limite - time.monotonic(), 0.5))
+                continue
+            # Retirarla también es una mutación: si no se replicara, el nodo que
+            # se promueva después la volvería a entregar.
+            resultado = MOTOR.proponer_y_esperar(
+                "retirar-respuesta", {"destinatario": destinatario},
+                max(limite, time.monotonic() + ESPERA_COMMIT))
+            if resultado == DESTITUIDO:
+                return self.redirigir()
+            if resultado != COMPROMETIDO:
+                break
+            return self.responder(200, respuesta)
+
+        self.responder(204, {})
 
     # -- observación --
 
@@ -507,8 +618,13 @@ class Manejador(BaseHTTPRequestHandler):
             return self.responder(400, {"error": "cuerpo no es un objeto JSON"})
         # El redirect va ANTES del handler, así que un nodo que no manda no
         # muta nada ni cuenta nada para una mayoría antes de contestar.
-        if ruta in RUTAS_DE_DATOS and not self.soy_master():
-            return self.redirigir()
+        if ruta in RUTAS_DE_DATOS:
+            if not self.soy_master():
+                return self.redirigir()
+            # 503 y no 421: este nodo SÍ es el master, sólo que todavía no sabe
+            # qué heredó. Dura un round-trip de commit.
+            if MOTOR is not None and MOTOR.recuperando:
+                return self.responder(503, {"error": "recuperando"})
         manejar(cuerpo)
 
 
@@ -530,26 +646,28 @@ class Servidor(ThreadingHTTPServer):
 
 
 def arrancar_motor():
-    """Wire the cluster's networking half, unless this node is alone.
+    """Wire the engine. Always — a lone node needs it too.
 
-    A lone node has nobody to talk to and is already master, so starting a
-    ticker for it would burn a thread to discover that nothing changed.
+    Even with no peers, the applier thread is what turns committed entries into
+    queue state, and it is the only writer to `Sistema` on every node. A single
+    node is a majority of one, so its proposals commit immediately; nothing
+    about the data path branches on how many peers there are.
     """
-    global DESPACHAR
-    if not PARES:
-        return None
-    motor = Motor(RAFT, token=TOKEN_CLUSTER, lock=LOCK_RAFT,
+    global DESPACHAR, MOTOR
+    MOTOR = Motor(RAFT, token=TOKEN_CLUSTER, lock=LOCK_RAFT,
                   intervalo_ms=max(10, RAFT_HEARTBEAT_MS // 3),
-                  registrar=bitacora)
-    DESPACHAR = motor.enviar
-    motor.arrancar()
-    return motor
+                  registrar=bitacora, sistema=SISTEMA, aplicador=APLICADOR,
+                  intervalo_recuperador_s=INTERVALO_RECUPERADOR)
+    DESPACHAR = MOTOR.enviar
+    MOTOR.arrancar()
+    return MOTOR
 
 
 def main():
     global ARRANCADO
     ARRANCADO = _ahora_iso()
-    threading.Thread(target=recuperador, daemon=True).start()
+    # El barrido de vencimientos lo corre el motor, y sólo en el master: un
+    # slave que venciera por su cuenta divergiría contra su propio reloj.
     arrancar_motor()
 
     servidor = Servidor((BIND, PUERTO), Manejador)
