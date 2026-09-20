@@ -90,7 +90,10 @@ class Aplicador:
             payload.get("atendidoPor"), payload.get("app"))
 
     def _retirar_respuesta(self, payload):
-        return self.sistema.retirar_respuesta(payload["destinatario"])
+        # El `id` es opcional a propósito: una entrada vieja, de antes de que
+        # se empezara a nombrar cuál se retira, se sigue aplicando como antes.
+        return self.sistema.retirar_respuesta(payload["destinatario"],
+                                              payload.get("id"))
 
     def _expirar(self, payload):
         return self.sistema.expirar(payload)

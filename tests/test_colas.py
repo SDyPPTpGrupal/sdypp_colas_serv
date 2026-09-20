@@ -200,6 +200,37 @@ class PruebasColaRespuestas(unittest.TestCase):
         self.assertFalse(self.cola.publicar("ba-1", {"id": "c"}))
         self.assertTrue(self.cola.publicar("ba-2", {"id": "d"}))
 
+    def test_dos_recolectores_sobre_la_misma_respuesta_no_pierden_la_siguiente(self):
+        """El balanceador abre BA_RECOLECTORES long-polls contra el mismo
+        destinatario, así que dos pueden espiar la misma respuesta antes de que
+        ninguno haya comprometido su retiro.
+
+        Sin el `id` en el retiro, el segundo en aplicarse sacaba la respuesta
+        SIGUIENTE y la tiraba: nadie la entregaba nunca, y el cliente que la
+        esperaba se comía el timeout entero con su pedido ya contestado. Es
+        pérdida silenciosa, y era invisible con un solo recolector.
+        """
+        self.cola.publicar("ba-1", {"id": "r1"})
+        self.cola.publicar("ba-1", {"id": "r2"})
+
+        espiada_a = self.cola.espiar("ba-1")
+        espiada_b = self.cola.espiar("ba-1")          # los dos ven r1
+        self.assertEqual(espiada_a["id"], espiada_b["id"])
+
+        self.assertEqual(self.cola.retirar("ba-1", espiada_a["id"])["id"], "r1")
+        self.assertIsNone(self.cola.retirar("ba-1", espiada_b["id"]),
+                          "el segundo retiro no tiene nada que sacar")
+
+        self.assertEqual(self.cola.espiar("ba-1")["id"], "r2",
+                         "r2 sigue ahí, esperando a quien la pidió")
+
+    def test_espiar_saltea_la_que_otro_ya_reclamo(self):
+        """El caso común: el segundo recolector no llega a espiar siquiera."""
+        self.cola.publicar("ba-1", {"id": "r1"})
+
+        self.assertEqual(self.cola.espiar("ba-1")["id"], "r1")
+        self.assertIsNone(self.cola.espiar("ba-1", excluidos={"r1"}))
+
     def test_purgar_tira_lo_que_nadie_recolecto(self):
         """El balanceador que se murió sin recolectar: sus respuestas no las va
         a leer nadie nunca y sin esto harían crecer la memoria hasta que duela."""

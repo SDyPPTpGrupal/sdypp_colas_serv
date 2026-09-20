@@ -431,15 +431,25 @@ class ColaRespuestas:
             self._hay.notify_all()
             return True
 
-    def espiar(self, destinatario):
+    def espiar(self, destinatario, excluidos=()):
         """La próxima respuesta de ese destinatario, sin sacarla. None si no hay.
 
         La saca el paso de aplicación, no el handler: el handler sólo necesita
         saber qué va a salir para poder devolverla cuando la entrada commitee.
+
+        `excluidos` son los ids que otro handler ya propuso retirar. Si la del
+        frente es una de ésas, acá no hay nada que hacer todavía: la cola es
+        FIFO por destinatario, así que la siguiente no se puede sacar antes.
+        Devolver None hace que el handler espere, que es lo correcto.
         """
         with self._hay:
             pendientes = self._por_destinatario.get(destinatario)
-            return pendientes[0][1] if pendientes else None
+            if not pendientes:
+                return None
+            respuesta = pendientes[0][1]
+            if respuesta.get("id") in excluidos:
+                return None
+            return respuesta
 
     def esperar_cambio(self, timeout):
         with self._hay:
@@ -467,6 +477,25 @@ class ColaRespuestas:
                 if restante <= 0:
                     return None
                 self._hay.wait(timeout=min(restante, LATIDO))
+
+    def retirar(self, destinatario, id=None):
+        """Saca la del frente, sin esperar. None si no había.
+
+        Con `id`, sólo la saca si la del frente es ésa. Esto es lo que hace
+        tolerable que dos recolectores propongan retirar la misma respuesta:
+        el segundo `retirar-respuesta` en comprometerse encuentra otra cosa al
+        frente —o nada— y no hace nada. Sin la comprobación, ese segundo retiro
+        sacaría la respuesta SIGUIENTE y la tiraría sin que nadie la haya
+        entregado nunca: el cliente que la esperaba se come el timeout entero y
+        el pedido queda contestado para la cola y perdido para él.
+        """
+        with self._hay:
+            pendientes = self._por_destinatario.get(destinatario)
+            if not pendientes:
+                return None
+            if id is not None and pendientes[0][1].get("id") != id:
+                return None
+            return pendientes.popleft()[1]
 
     def purgar(self):
         """Tira las respuestas que nadie recolectó a tiempo. Devuelve cuántas.
@@ -632,9 +661,10 @@ class Sistema:
     def reservar_pedido(self, id, consumidor, reservado_hasta_ms):
         return self.pedidos.reservar(id, consumidor, reservado_hasta_ms)
 
-    def retirar_respuesta(self, destinatario):
-        """Saca una respuesta sin esperar. None si no había."""
-        return self.respuestas.tomar(destinatario, 0)
+    def retirar_respuesta(self, destinatario, id=None):
+        """Saca una respuesta sin esperar. None si no había, o si el frente ya
+        no es la que `id` nombra."""
+        return self.respuestas.retirar(destinatario, id)
 
     def pedido_en_vuelo(self, id):
         return self.pedidos.en_vuelo(id)
@@ -642,8 +672,8 @@ class Sistema:
     def obtener_pedido(self, id):
         return self.pedidos.obtener(id)
 
-    def espiar_respuesta(self, destinatario):
-        return self.respuestas.espiar(destinatario)
+    def espiar_respuesta(self, destinatario, excluidos=()):
+        return self.respuestas.espiar(destinatario, excluidos)
 
     def esperar_pedidos(self, timeout):
         self.pedidos.esperar_cambio(timeout)

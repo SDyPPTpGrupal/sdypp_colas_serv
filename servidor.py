@@ -112,6 +112,18 @@ TOKEN_CONSUMIDOR = os.environ.get("COLA_TOKEN_CONSUMIDOR", TOKEN)
 TOKEN_CLUSTER = os.environ.get("COLA_TOKEN_CLUSTER", TOKEN)
 
 CONTRATO = "1.0"
+_TOKENS_POR_CLASE = {"publicador": TOKEN_PUBLICADOR,
+                     "consumidor": TOKEN_CONSUMIDOR,
+                     "cluster": TOKEN_CLUSTER}
+
+
+def _resumen_tokens():
+    """Qué clases tienen token. Mirar sólo COLA_TOKEN mentía: las tres
+    variables específicas pueden estar puestas con el genérico vacío."""
+    return "/".join(clase if valor else f"{clase}:NO"
+                    for clase, valor in _TOKENS_POR_CLASE.items())
+
+
 INSTANCIA = os.environ.get("COLA_INSTANCIA", f"{NOMBRE}-{PUERTO}@{CASA}")
 MI_URL = os.environ.get("COLA_URL", f"http://{BIND}:{PUERTO}")
 
@@ -492,14 +504,22 @@ class Manejador(BaseHTTPRequestHandler):
         primera = True
         while primera or time.monotonic() < limite:
             primera = False
-            respuesta = SISTEMA.espiar_respuesta(destinatario)
+            respuesta = SISTEMA.espiar_respuesta(destinatario,
+                                                 MOTOR.ids_propuestos())
             if respuesta is None:
                 SISTEMA.esperar_respuestas(min(limite - time.monotonic(), 0.5))
                 continue
             # Retirarla también es una mutación: si no se replicara, el nodo que
             # se promueva después la volvería a entregar.
+            #
+            # Y la entrada nombra CUÁL se retira. El balanceador abre varios
+            # recolectores contra el mismo destinatario (BA_RECOLECTORES=4), así
+            # que dos pueden espiar la misma respuesta antes de que ninguno haya
+            # comprometido su retiro. Sin el id, el segundo retiro en aplicarse
+            # sacaría la respuesta siguiente y la tiraría sin entregarla.
             resultado = MOTOR.proponer_y_esperar(
-                "retirar-respuesta", {"destinatario": destinatario},
+                "retirar-respuesta",
+                {"destinatario": destinatario, "id": respuesta.get("id")},
                 max(limite, time.monotonic() + ESPERA_COMMIT))
             if resultado == DESTITUIDO:
                 return self.redirigir()
@@ -528,6 +548,14 @@ class Manejador(BaseHTTPRequestHandler):
             "rol": RAFT.rol,
             "termino": RAFT.termino_actual,
             "masterConocido": RAFT.master_conocido,
+            # Log position and catch-up state. Not required by the contract's
+            # minimum, but it is what turns a failover from something you infer
+            # into something you can watch: a slave that is behind shows it
+            # here, and `recuperando` is the window in which this node answers
+            # 503 on the data routes despite already being master.
+            "indiceLog": RAFT.indice_ultimo,
+            "indiceCommit": RAFT.indice_commit,
+            "recuperando": MOTOR.recuperando,
             "esperando": estado["pedidos"]["esperando"],
             "enVuelo": estado["pedidos"]["enVuelo"],
             "cota": estado["pedidos"]["cota"],
@@ -677,12 +705,13 @@ def main():
     bitacora("arranque", "OK",
              f"escucha={BIND}:{PUERTO} cotaPedidos={COTA_PEDIDOS} "
              f"cotaRespuestas={COTA_RESPUESTAS} reserva={RESERVA}s ttl={TTL_RESPUESTAS}s "
-             f"token={'sí' if TOKEN else 'NO'} "
+             f"tokens={_resumen_tokens()} "
              f"instancia={INSTANCIA} pares={len(PARES)} "
              f"modo={'clúster' if PARES else 'nodo solo'}")
-    if not TOKEN:
-        print("[cola] sin COLA_TOKEN: cualquiera que alcance el puerto puede "
-              "publicar y tomar pedidos", flush=True)
+    abiertas = [clase for clase, valor in _TOKENS_POR_CLASE.items() if not valor]
+    if abiertas:
+        print(f"[cola] sin token de {', '.join(abiertas)}: cualquiera que alcance "
+              f"el puerto puede usar esas rutas", flush=True)
     try:
         servidor.serve_forever()
     except KeyboardInterrupt:
