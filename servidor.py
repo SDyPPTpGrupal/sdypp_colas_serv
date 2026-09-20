@@ -304,6 +304,7 @@ class Manejador(BaseHTTPRequestHandler):
         if presupuesto <= 0:
             return self.responder(400, {"error": "presupuestoMs tiene que ser positivo"})
 
+        ahora_ms = SISTEMA.reloj_ms()
         pedido = Pedido(
             id=str(cuerpo.get("id") or uuid.uuid4().hex),
             operacion=operacion,
@@ -312,8 +313,12 @@ class Manejador(BaseHTTPRequestHandler):
             # marcado idempotente por error se puede ejecutar dos veces.
             idempotente=bool(cuerpo.get("idempotente", False)),
             destinatario=destinatario,
-            vence_en=time.monotonic() + presupuesto,
+            # Época absoluta, no monótono: el vencimiento se replica, y un
+            # valor monótono sólo significa algo dentro de este proceso.
+            vence_en_ms=ahora_ms + int(presupuesto * 1000),
+            encolado_en_ms=ahora_ms,
             cliente=cuerpo.get("cliente"),
+            reloj_ms=SISTEMA.reloj_ms,
         )
         if not SISTEMA.publicar_pedido(pedido):
             estado = SISTEMA.pedidos.estado()

@@ -34,6 +34,13 @@ from dataclasses import dataclass, field
 LATIDO = 0.5
 
 
+def _ahora_epoch_ms():
+    """Milisegundos de época. Los vencimientos se replican, así que no pueden
+    ser monótonos: un valor monótono sólo significa algo adentro del proceso que
+    lo produjo, y hay que poder compararlos entre procesos distintos."""
+    return int(time.time() * 1000)
+
+
 @dataclass
 class Pedido:
     """Una request HTTP esperando a que una réplica la atienda.
@@ -43,11 +50,19 @@ class Pedido:
     quizá ni siquiera esté escrito en Python. Por eso la operación es un string
     y los parámetros un diccionario.
 
-    `vence_en` es un solo presupuesto para todo el viaje, espera en la cola
+    `vence_en_ms` es un solo presupuesto para todo el viaje, espera en la cola
     incluida: un pedido que esperó 4 s tiene 1 s para que lo atiendan, no 5.
-    Se guarda en el reloj monótono **de este proceso**, y lo que viaja al worker
-    es cuánto le queda (`quedaMs`), no un instante absoluto: así los relojes
-    desincronizados de cuatro casas no entran en la cuenta.
+
+    Es un instante **absoluto en milisegundos de época**, sellado por el master
+    al agregar la entrada al log, y cada nodo lo guarda tal cual. Un slave que
+    guardara el `vence_en` monótono del master tendría una cola entera de
+    vencimientos de una época ajena, y al promoverse estarían todos mal por un
+    margen impredecible.
+
+    Lo que viaja al worker sigue siendo cuánto le queda (`quedaMs`) y nunca un
+    instante: los relojes de cuatro casas siguen fuera de la cuenta del
+    presupuesto. Lo que cambia es la exposición, mucho más chica, de tres nodos
+    discrepando sobre la hora, y sólo en el instante del failover.
     """
 
     id: str
@@ -55,20 +70,23 @@ class Pedido:
     parametros: dict                # lo que necesita esa operación, ya validado
     idempotente: bool               # False sólo para POST /personas
     destinatario: str               # quién espera la respuesta: "balanceador@casa-tomas"
-    vence_en: float                 # time.monotonic() + presupuesto
+    vence_en_ms: int                # época ms; lo sella el master
+    encolado_en_ms: int             # época ms; obligatorio, nunca un default_factory
     cliente: str | None = None      # IP de quien hizo la request
-    encolado_en: float = field(default_factory=time.monotonic)
     intentos: list = field(default_factory=list)   # consumidores que lo tomaron, en orden
     reservado_por: str | None = None
-    reservado_hasta: float | None = None
+    reservado_hasta_ms: int | None = None
+    # Inyectable para que un test no dependa del reloj de pared. Fuera del
+    # repr y de la igualdad: es una dependencia, no un dato del pedido.
+    reloj_ms: object = field(default=_ahora_epoch_ms, repr=False, compare=False)
 
     def queda(self):
         """Segundos de presupuesto que le quedan. Negativo si ya venció."""
-        return self.vence_en - time.monotonic()
+        return (self.vence_en_ms - self.reloj_ms()) / 1000
 
     def como_json(self):
-        """Lo que ve el worker. No lleva `vence_en` ni `reservado_hasta`: son
-        instantes del reloj de este proceso y allá no significarían nada."""
+        """Lo que ve el worker. No lleva vencimientos: son instantes absolutos
+        y lo único que le sirve al worker es cuánto le queda."""
         return {
             "id": self.id,
             "operacion": self.operacion,
@@ -91,12 +109,12 @@ class ColaPedidos:
     toma espera. Sin candado, dos workers podrían llevarse el mismo pedido.
     """
 
-    def __init__(self, cota, reserva):
+    def __init__(self, cota, reserva, reloj_ms=_ahora_epoch_ms):
         self.cota = cota
         self.reserva = reserva          # segundos que un worker tiene para contestar
+        self.reloj_ms = reloj_ms
         self._esperando = deque()       # los que nadie tomó todavía
         self._en_vuelo = {}             # id -> Pedido tomado y sin contestar
-        self._a_fallar = deque()        # (pedido, estado, detalle) que el recuperador drena
         self._hay = threading.Condition()
         self.publicados = 0
         self.reasignados = 0
@@ -135,14 +153,14 @@ class ColaPedidos:
         with self._hay:
             self.vistos[consumidor] = time.monotonic()
             while True:
-                pedido = self._proximo_vivo()
-                if pedido is not None:
-                    ahora = time.monotonic()
-                    pedido.reservado_por = consumidor
-                    pedido.reservado_hasta = min(ahora + self.reserva, pedido.vence_en)
-                    pedido.intentos.append(consumidor)
-                    self._en_vuelo[pedido.id] = pedido
-                    return pedido
+                ahora_ms = self.reloj_ms()
+                clase, dato = self._inspeccionar(ahora_ms, ())
+                if clase == "vivo":
+                    hasta = min(ahora_ms + int(self.reserva * 1000),
+                                self._buscar(dato).vence_en_ms)
+                    return self._reservar(dato, consumidor, hasta)
+                # "vencidos" no se entrega ni se limpia acá: sacarlos es una
+                # mutación, y bajo replicación toda mutación viaja por el log.
                 restante = limite - time.monotonic()
                 if restante <= 0:
                     return None
@@ -161,7 +179,7 @@ class ColaPedidos:
                 return False
             del self._en_vuelo[id]
             pedido.reservado_por = None
-            pedido.reservado_hasta = None
+            pedido.reservado_hasta_ms = None
             self._esperando.appendleft(pedido)
             self._hay.notify()
             return True
@@ -209,41 +227,91 @@ class ColaPedidos:
             puede crear la persona dos veces. Preferimos un 504 honesto a un
             duplicado silencioso.
         """
-        ahora = time.monotonic()
-        fallidos = []
+        return self.aplicar_expiry(self.detectar_vencidos(self.reloj_ms()))
+
+    # -- expiry, partido en decidir (impuro) y aplicar (determinista) --
+
+    def detectar_vencidos(self, ahora_ms):
+        """Qué habría que vencer, sin tocar nada. Sólo lo corre el master.
+
+        Devuelve listas de ids explícitas y nunca predicados: un predicado
+        reevaluado en otro nodo, en otro instante, es una decisión distinta. Lo
+        que viaja por el log es la decisión ya tomada.
+        """
+        reencolar, fallar = [], []
         with self._hay:
-            while self._a_fallar:
-                fallidos.append(self._a_fallar.popleft())
-
-            for pedido in list(self._en_vuelo.values()):
-                if pedido.reservado_hasta > ahora:
+            for pedido in self._en_vuelo.values():
+                if pedido.reservado_hasta_ms is not None and pedido.reservado_hasta_ms > ahora_ms:
                     continue
-                del self._en_vuelo[pedido.id]
                 quien = pedido.reservado_por
-                pedido.reservado_por = None
-                pedido.reservado_hasta = None
-                if pedido.queda() <= 0:
-                    fallidos.append((pedido, "DEADLINE_EXCEEDED",
-                                     f"venció mientras lo atendía {quien}"))
+                if pedido.vence_en_ms <= ahora_ms:
+                    fallar.append({"id": pedido.id, "estado": "DEADLINE_EXCEEDED",
+                                   "detalle": f"venció mientras lo atendía {quien}"})
                 elif pedido.idempotente:
-                    self._esperando.appendleft(pedido)
-                    self.reasignados += 1
-                    self._hay.notify()
+                    reencolar.append(pedido.id)
                 else:
-                    fallidos.append((pedido, "DEADLINE_EXCEEDED",
-                                     f"{quien} no contestó y la operación no es idempotente"))
-
+                    fallar.append({"id": pedido.id, "estado": "DEADLINE_EXCEEDED",
+                                   "detalle": f"{quien} no contestó y la operación "
+                                              f"no es idempotente"})
             # Los que siguen esperando turno y ya no llegan a tiempo. Se fallan
             # acá y no cuando alguien los tome: sacarlos ya libera lugar en la
             # cola para pedidos que sí pueden llegar a tiempo.
-            vivos = deque()
             for pedido in self._esperando:
-                if pedido.queda() <= 0:
-                    fallidos.append((pedido, "DEADLINE_EXCEEDED", "venció esperando en la cola"))
-                else:
-                    vivos.append(pedido)
-            self._esperando = vivos
+                if pedido.vence_en_ms <= ahora_ms:
+                    fallar.append({"id": pedido.id, "estado": "DEADLINE_EXCEEDED",
+                                   "detalle": "venció esperando en la cola"})
+        return {"reencolar": reencolar, "fallar": fallar, "decididoEnMs": ahora_ms}
+
+    def aplicar_expiry(self, decision):
+        """Ejecuta una decisión ya tomada. Determinista y repetible.
+
+        Aplicarla dos veces no hace nada la segunda: cada id se busca antes de
+        tocarlo y, si ya no está, se saltea. Hace falta porque una entrada del
+        log puede reaplicarse después de un failover.
+        """
+        fallidos = []
+        with self._hay:
+            for id in decision.get("reencolar", ()):
+                pedido = self._en_vuelo.pop(id, None)
+                if pedido is None:
+                    continue
+                pedido.reservado_por = None
+                pedido.reservado_hasta_ms = None
+                self._esperando.appendleft(pedido)
+                self.reasignados += 1
+                self._hay.notify()
+            for caso in decision.get("fallar", ()):
+                pedido = self._sacar(caso["id"])
+                if pedido is None:
+                    continue
+                pedido.reservado_por = None
+                pedido.reservado_hasta_ms = None
+                fallidos.append((pedido, caso["estado"], caso["detalle"]))
         return fallidos
+
+    def inspeccionar_frente(self, ahora_ms, excluidos=()):
+        """Qué hay al frente, sin sacarlo: ("vacio"|"vencidos"|"vivo", dato).
+
+        Reemplaza al viejo `_proximo_vivo()`, que sacaba los vencidos del camino
+        y los apartaba. Bajo replicación eso no se puede: notar un vencimiento
+        no puede ser, en sí mismo, una mutación — la mutación tiene que pasar
+        primero por el log.
+        """
+        with self._hay:
+            return self._inspeccionar(ahora_ms, excluidos)
+
+    def reservar(self, id, consumidor, reservado_hasta_ms):
+        """Reserva un pedido puntual. None si no estaba esperando.
+
+        Toma por id y no por turno porque el paso de aplicación repite una
+        decisión ya tomada por el master: no vuelve a elegir.
+        """
+        with self._hay:
+            return self._reservar(id, consumidor, reservado_hasta_ms)
+
+    def en_vuelo(self, id):
+        with self._hay:
+            return id in self._en_vuelo
 
     def estado(self):
         ahora = time.monotonic()
@@ -264,15 +332,45 @@ class ColaPedidos:
 
     # -- interno --
 
-    def _proximo_vivo(self):
-        """El primero que todavía tiene presupuesto. Los vencidos que encuentra
-        en el camino los aparta para que el recuperador los falle: entregarle a
-        un worker un pedido que ya venció es gastarle una réplica al pedo."""
-        while self._esperando:
-            pedido = self._esperando.popleft()
-            if pedido.queda() > 0:
+    def _inspeccionar(self, ahora_ms, excluidos):
+        """Sin candado propio: lo llaman con `_hay` tomado."""
+        vencidos = []
+        for pedido in self._esperando:
+            if pedido.id in excluidos:
+                continue
+            if pedido.vence_en_ms > ahora_ms:
+                return "vivo", pedido.id
+            vencidos.append(pedido.id)
+        if vencidos:
+            return "vencidos", vencidos
+        return "vacio", None
+
+    def _reservar(self, id, consumidor, reservado_hasta_ms):
+        for i, pedido in enumerate(self._esperando):
+            if pedido.id == id:
+                del self._esperando[i]
+                pedido.reservado_por = consumidor
+                pedido.reservado_hasta_ms = reservado_hasta_ms
+                pedido.intentos.append(consumidor)
+                self._en_vuelo[pedido.id] = pedido
                 return pedido
-            self._a_fallar.append((pedido, "DEADLINE_EXCEEDED", "venció esperando en la cola"))
+        return None
+
+    def _buscar(self, id):
+        for pedido in self._esperando:
+            if pedido.id == id:
+                return pedido
+        return None
+
+    def _sacar(self, id):
+        """Lo saca de donde esté. None si ya no está en ninguna de las dos."""
+        pedido = self._en_vuelo.pop(id, None)
+        if pedido is not None:
+            return pedido
+        for i, p in enumerate(self._esperando):
+            if p.id == id:
+                del self._esperando[i]
+                return p
         return None
 
 
@@ -291,9 +389,10 @@ class ColaRespuestas:
     la memoria de este proceso hasta que alguien lo note.
     """
 
-    def __init__(self, cota, ttl):
+    def __init__(self, cota, ttl, reloj_ms=_ahora_epoch_ms):
         self.cota = cota                # por destinatario, no total
         self.ttl = ttl
+        self.reloj_ms = reloj_ms
         self._por_destinatario = {}     # destinatario -> deque de (instante, respuesta)
         self._hay = threading.Condition()
         self.publicadas = 0
@@ -310,12 +409,22 @@ class ColaRespuestas:
             pendientes = self._por_destinatario.setdefault(destinatario, deque())
             if len(pendientes) >= self.cota:
                 return False
-            pendientes.append((time.monotonic(), respuesta))
+            pendientes.append((self.reloj_ms(), respuesta))
             self.publicadas += 1
             # notify_all y no notify: los que esperan son de destinatarios
             # distintos y el que despierte puede no ser el dueño de esta.
             self._hay.notify_all()
             return True
+
+    def saturado(self, destinatario):
+        """¿Rechazaría una respuesta más para ese destinatario?
+
+        Lo consulta `Sistema.responder()` antes de sacar el pedido, para no
+        dejar un medio-apply si la respuesta no entra.
+        """
+        with self._hay:
+            pendientes = self._por_destinatario.get(destinatario)
+            return pendientes is not None and len(pendientes) >= self.cota
 
     def tomar(self, destinatario, espera):
         """La próxima respuesta de ese destinatario. None si no hubo en `espera` segundos."""
@@ -331,12 +440,43 @@ class ColaRespuestas:
                 self._hay.wait(timeout=min(restante, LATIDO))
 
     def purgar(self):
-        """Tira las respuestas que nadie recolectó a tiempo. Devuelve cuántas."""
-        corte = time.monotonic() - self.ttl
+        """Tira las respuestas que nadie recolectó a tiempo. Devuelve cuántas.
+
+        Envoltorio de decidir+aplicar, para un nodo solo y para los tests.
+        """
+        ahora_ms = self.reloj_ms()
+        return self.aplicar_purga(self.detectar_purgables(ahora_ms),
+                                  corte_ms=ahora_ms - int(self.ttl * 1000))
+
+    def detectar_purgables(self, ahora_ms):
+        """Cuántas hay para tirar por destinatario. No toca nada."""
+        corte = ahora_ms - int(self.ttl * 1000)
+        purga = {}
+        with self._hay:
+            for destinatario, pendientes in self._por_destinatario.items():
+                cuantas = sum(1 for instante, _ in pendientes if instante < corte)
+                if cuantas:
+                    purga[destinatario] = cuantas
+        return purga
+
+    def aplicar_purga(self, purga, corte_ms=None):
+        """Tira lo que dice la decisión. Devuelve cuántas tiró.
+
+        Con `corte_ms`, sólo tira las anteriores a ese instante, y por eso
+        reaplicar la misma decisión no tira de más. Sin él tira por cantidad,
+        que alcanza para un nodo solo.
+        """
         tiradas = 0
         with self._hay:
-            for destinatario, pendientes in list(self._por_destinatario.items()):
-                while pendientes and pendientes[0][0] < corte:
+            for destinatario, cuantas in (purga or {}).items():
+                pendientes = self._por_destinatario.get(destinatario)
+                if not pendientes:
+                    continue
+                for _ in range(cuantas):
+                    if not pendientes:
+                        break
+                    if corte_ms is not None and pendientes[0][0] >= corte_ms:
+                        break
                     pendientes.popleft()
                     tiradas += 1
                 if not pendientes:
@@ -367,9 +507,11 @@ class Sistema:
     única forma de que dos hilos no se traben entre sí.
     """
 
-    def __init__(self, cota_pedidos, cota_respuestas, reserva, ttl_respuestas):
-        self.pedidos = ColaPedidos(cota_pedidos, reserva)
-        self.respuestas = ColaRespuestas(cota_respuestas, ttl_respuestas)
+    def __init__(self, cota_pedidos, cota_respuestas, reserva, ttl_respuestas,
+                 reloj_ms=_ahora_epoch_ms):
+        self.reloj_ms = reloj_ms
+        self.pedidos = ColaPedidos(cota_pedidos, reserva, reloj_ms)
+        self.respuestas = ColaRespuestas(cota_respuestas, ttl_respuestas, reloj_ms)
         self.atendidos = {}          # consumidor -> cuántas contestó, para /health
         self._lock = threading.Lock()
 
@@ -396,15 +538,24 @@ class Sistema:
         ni por cuántas réplicas pasó antes el pedido, y si se lo preguntáramos
         podría mentir.
         """
-        pedido = self.pedidos.completar(id)
-        if pedido is None:
-            return False, "desconocido"
+        with self.pedidos._hay:
+            pedido = self.pedidos._en_vuelo.get(id) or self.pedidos._buscar(id)
+            if pedido is None:
+                return False, "desconocido"
+            # La saturación se evalúa ANTES de sacar el pedido. Antes se sacaba
+            # primero y se descubría después, que es un medio-apply: el pedido
+            # desaparecía y la respuesta no se publicaba. Con un solo nodo era
+            # un pedido perdido; replicado, es divergencia silenciosa y
+            # permanente entre nodos que aplicaron la misma entrada.
+            if self.respuestas.saturado(pedido.destinatario):
+                return False, "destinatario-saturado"
+            pedido = self.pedidos.completar(id)
+
         if atendido_por:
             with self._lock:
                 self.atendidos[atendido_por] = self.atendidos.get(atendido_por, 0) + 1
         respuesta = self._armar(pedido, estado, contenido, atendido_por, app)
-        if not self.respuestas.publicar(pedido.destinatario, respuesta):
-            return False, "destinatario-saturado"
+        self.respuestas.publicar(pedido.destinatario, respuesta)
         return True, "entregada"
 
     def recuperar(self):
@@ -415,13 +566,52 @@ class Sistema:
         sabe que dejar al cliente esperando hasta su propio timeout sin que nadie
         le diga por qué.
         """
+        return self.expirar(self.decidir_expiry(self.reloj_ms()))
+
+    def decidir_expiry(self, ahora_ms):
+        """La decisión completa de un ciclo de mantenimiento. No muta nada.
+
+        Sólo la corre el master: los slaves no vencen nada por su cuenta, porque
+        con tres relojes distintos tomarían tres decisiones distintas en el mismo
+        instante y divergirían.
+        """
+        decision = self.pedidos.detectar_vencidos(ahora_ms)
+        decision["purgar"] = self.respuestas.detectar_purgables(ahora_ms)
+        decision["corteRespuestasMs"] = ahora_ms - int(self.respuestas.ttl * 1000)
+        return decision
+
+    def expirar(self, decision):
+        """Aplica una decisión ya tomada. Devuelve (reencolados, fallados, purgadas).
+
+        Las dos mutaciones —sacar el pedido y publicar su respuesta de error— son
+        una sola entrada del log y se aplican juntas, así que ningún lector puede
+        ver un estado intermedio donde el pedido ya no está y la respuesta no
+        llegó.
+        """
         antes = self.pedidos.reasignados
         fallados = []
-        for pedido, estado, detalle in self.pedidos.recuperar():
+        for pedido, estado, detalle in self.pedidos.aplicar_expiry(decision):
             respuesta = self._armar(pedido, estado, {"error": detalle}, None, None)
             self.respuestas.publicar(pedido.destinatario, respuesta)
             fallados.append((pedido, estado, detalle))
-        return self.pedidos.reasignados - antes, fallados, self.respuestas.purgar()
+        purgadas = self.respuestas.aplicar_purga(decision.get("purgar"),
+                                                 decision.get("corteRespuestasMs"))
+        return self.pedidos.reasignados - antes, fallados, purgadas
+
+    # -- superficie que usa el paso de aplicación del log --
+
+    def reservar_pedido(self, id, consumidor, reservado_hasta_ms):
+        return self.pedidos.reservar(id, consumidor, reservado_hasta_ms)
+
+    def retirar_respuesta(self, destinatario):
+        """Saca una respuesta sin esperar. None si no había."""
+        return self.respuestas.tomar(destinatario, 0)
+
+    def pedido_en_vuelo(self, id):
+        return self.pedidos.en_vuelo(id)
+
+    def inspeccionar_frente(self, ahora_ms, excluidos=()):
+        return self.pedidos.inspeccionar_frente(ahora_ms, excluidos)
 
     def tomar_respuesta(self, destinatario, espera):
         return self.respuestas.tomar(destinatario, espera)
@@ -460,5 +650,5 @@ class Sistema:
             "atendidoPor": atendido_por,
             "app": app,
             "intentos": list(pedido.intentos),
-            "esperaMs": int((time.monotonic() - pedido.encolado_en) * 1000),
+            "esperaMs": max(int(self.reloj_ms() - pedido.encolado_en_ms), 0),
         }
