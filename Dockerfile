@@ -19,7 +19,11 @@ WORKDIR /app
 # no se nota hasta que hace falta la bitácora para la auditoría cruzada.
 RUN useradd --create-home --uid 1000 cola
 
-COPY colas.py servidor.py ./
+# Los cinco módulos del servicio. Van nombrados uno por uno en vez de un
+# `COPY . .` para que la imagen no se lleve tests, logs ni el .git, y para
+# que agregar un módulo sea una decisión visible en el diff y no algo que
+# entra solo.
+COPY colas.py raft.py aplicar.py motor.py servidor.py ./
 
 RUN mkdir -p /app/logs && chown -R cola:cola /app
 USER cola
@@ -37,10 +41,14 @@ ENV COLA_PUERTO=8085 \
 
 EXPOSE 8085
 
-# /health no pide token a propósito: lo consulta el HEALTHCHECK, que no tiene
-# por qué llevar el secreto adentro, y no dice nada que no se vea desde afuera.
+# /health/vivo, no /health, y la diferencia importa: esto es liveness, no
+# readiness. Un nodo en elección, o un master recién electo que todavía está
+# recuperando, no tiene master ni sirve las rutas de datos — pero el proceso
+# está perfecto y reiniciarlo ahí sería cortar la elección por la mitad y
+# empezar otra. /health/vivo contesta 200 mientras el proceso atienda HTTP, y
+# tampoco lleva token ni dice nada del estado de las colas.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import os,urllib.request,sys; p=os.environ.get('COLA_PUERTO','8085'); sys.exit(0 if urllib.request.urlopen(f'http://localhost:{p}/health',timeout=2).status==200 else 1)"
+    CMD python -c "import os,urllib.request,sys; p=os.environ.get('COLA_PUERTO','8085'); sys.exit(0 if urllib.request.urlopen(f'http://localhost:{p}/health/vivo',timeout=2).status==200 else 1)"
 
 STOPSIGNAL SIGTERM
 
