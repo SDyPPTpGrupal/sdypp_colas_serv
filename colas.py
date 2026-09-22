@@ -495,7 +495,14 @@ class ColaRespuestas:
                 return None
             if id is not None and pendientes[0][1].get("id") != id:
                 return None
-            return pendientes.popleft()[1]
+            respuesta = pendientes.popleft()[1]
+            # La caja vacía se borra acá y no sólo en la purga, que nada más ve
+            # las que tienen algo vencido. Con un destinatario por ticket (los
+            # pedidos asincrónicos del balanceador) quedarían miles de cajas
+            # vacías para siempre, y todas saldrían en `/estado`.
+            if not pendientes:
+                del self._por_destinatario[destinatario]
+            return respuesta
 
     def purgar(self):
         """Tira las respuestas que nadie recolectó a tiempo. Devuelve cuántas.

@@ -200,6 +200,17 @@ class PruebasColaRespuestas(unittest.TestCase):
         self.assertFalse(self.cola.publicar("ba-1", {"id": "c"}))
         self.assertTrue(self.cola.publicar("ba-2", {"id": "d"}))
 
+    def test_retirar_la_ultima_borra_la_caja(self):
+        """Con un destinatario por ticket, una caja vacía que queda es una por
+        pedido asincrónico, para siempre. Y el mismo destinatario tiene que
+        poder volver a recibir después de vaciarse."""
+        self.cola.publicar("ticket:a", {"id": "a"})
+        self.assertEqual(self.cola.retirar("ticket:a")["id"], "a")
+        self.assertEqual(self.cola.estado()["porDestinatario"], {})
+
+        self.cola.publicar("ticket:a", {"id": "a2"})
+        self.assertEqual(self.cola.tomar("ticket:a", 0)["id"], "a2")
+
     def test_dos_recolectores_sobre_la_misma_respuesta_no_pierden_la_siguiente(self):
         """El balanceador abre BA_RECOLECTORES long-polls contra el mismo
         destinatario, así que dos pueden espiar la misma respuesta antes de que
